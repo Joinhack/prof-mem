@@ -1,0 +1,14 @@
+[package]
+name = "prof-mem"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+msg = ["libc"]
+
+default = []
+
+[dependencies]
+backtrace = "0.3.75"
+
+libc = { version = "0.2.174", optional = true }
