@@ -12,11 +12,12 @@ fn test_print() {
             dump().unwrap();
         }
     }
-    thread::spawn(|| {
+    let join = thread::spawn(|| {
         for i in 0..1000 {
             if i == 100 {
                 dump().unwrap();
             }
         }
     });
+    join.join().unwrap();
 }
