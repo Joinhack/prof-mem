@@ -38,7 +38,7 @@ impl StringsTable {
 }
 
 #[derive(Default)]
-struct FuncationsTable {
+struct FuncsTable {
     table: Vec<Function>,
     index: HashMap<*mut c_void, usize>,
 }
@@ -48,7 +48,7 @@ enum FuncationAdd {
     Insert(usize),
 }
 
-impl FuncationsTable {
+impl FuncsTable {
     pub fn add(&mut self, strings: &mut StringsTable, symbol: Symbol) -> FuncationAdd {
         match self.index.get(&symbol.addr) {
             Some(index) => FuncationAdd::Exist(*index),
@@ -74,7 +74,7 @@ impl FuncationsTable {
 
 pub struct ProfileProtoWriter<T: Write> {
     strings_table: StringsTable,
-    functions_table: FuncationsTable,
+    funcs_table: FuncsTable,
     loc_table: Vec<Location>,
     samples: Vec<Sample>,
     writer: T,
@@ -84,7 +84,7 @@ impl<T: Write> ProfileProtoWriter<T> {
     pub(crate) fn new(writer: T) -> Self {
         Self {
             strings_table: StringsTable::new(),
-            functions_table: Default::default(),
+            funcs_table: Default::default(),
             loc_table: Vec::new(),
             samples: Vec::new(),
             writer,
@@ -98,7 +98,7 @@ impl<T: Write> ProfileProtoWriter<T> {
         for frame in frames {
             let line_no = frame.line_no as i64;
             let address = frame.addr as u64;
-            let func_index = match self.functions_table.add(&mut self.strings_table, frame) {
+            let func_index = match self.funcs_table.add(&mut self.strings_table, frame) {
                 FuncationAdd::Exist(idx) => {
                     locs.push(idx as _);
                     continue;
@@ -123,7 +123,7 @@ impl<T: Write> ProfileProtoWriter<T> {
             self.loc_table.push(loc);
         }
         let lab = Label {
-            key: self.strings_table.add("block".into()) as _,
+            key: self.strings_table.add("alloc".into()) as _,
             str: self.strings_table.add(format!("{:p}", ptr)) as _,
             ..Default::default()
         };
@@ -139,7 +139,7 @@ impl<T: Write> ProfileProtoWriter<T> {
     pub(crate) fn flush(self) -> std::io::Result<()> {
         let Self {
             mut strings_table,
-            functions_table,
+            funcs_table,
             loc_table,
             samples,
             mut writer,
@@ -154,7 +154,7 @@ impl<T: Write> ProfileProtoWriter<T> {
             sample_type: vec![samples_value],
             sample: samples,
             string_table: strings_table.table,
-            function: functions_table.table,
+            function: funcs_table.table,
             location: loc_table,
             ..Default::default()
         };
