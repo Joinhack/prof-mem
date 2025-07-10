@@ -2,14 +2,14 @@
 #[macro_use]
 mod msg;
 
-mod native;
+mod entry;
 mod profile_proto;
 mod profiler;
 pub use crate::profiler::dump;
 use crate::profiler::get_profiler;
 use std::alloc::{GlobalAlloc, System};
 
-use crate::native::AllocEntry;
+use crate::entry::AllocEntry;
 
 pub struct ProfAlloc(pub usize);
 
@@ -21,8 +21,7 @@ unsafe impl GlobalAlloc for ProfAlloc {
         if !alloc_entry.top_entry() {
             return ptr;
         }
-        #[cfg(feature = "msg")]
-        msg!("alloc_guard.0 {}", alloc_record.0);
+
         let profiler = get_profiler(Some(self.0));
         profiler.insert(ptr, layout);
         ptr

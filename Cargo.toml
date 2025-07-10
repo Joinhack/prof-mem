@@ -12,6 +12,3 @@ default = []
 backtrace = "0.3.75"
 libc = { version = "0.2.174", optional = true }
 protobuf = "3.7.2"
-
-[build-dependencies]
-cc = "1.2.29"

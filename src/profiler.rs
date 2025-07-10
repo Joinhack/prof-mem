@@ -9,26 +9,27 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{native::AllocEntry, profile_proto::ProfileProtoWriter};
+use crate::{entry::AllocEntry, profile_proto::ProfileProtoWriter};
 
 thread_local! {
     static LOCKED:Cell<bool> = Cell::new(false);
 }
 
-#[allow(dead_code)]
 pub(crate) struct LockGuard<'a>(Option<std::sync::MutexGuard<'a, ()>>);
 
 impl<'a> Drop for LockGuard<'a> {
     fn drop(&mut self) {
+        // if locked, set the lock flag.
         if self.0.is_some() {
-            LOCKED.with(|c| {
-                assert!(c.get());
-                c.set(false);
+            LOCKED.with(|locked| {
+                assert!(locked.get());
+                locked.set(false);
             })
         }
     }
 }
 
+/// alloc frame
 struct AllocFrames {
     size: usize,
     frames: Vec<*mut c_void>,
@@ -41,11 +42,12 @@ pub(crate) struct AllocSymbolFrames {
 }
 
 pub(crate) struct Symbol {
-    pub file_name: String,
-    pub line_no: u32,
-    pub col_no: u32,
-    pub name: String,
-    pub addr: *mut c_void,
+    pub(crate) file_name: String,
+    pub(crate) line_no: u32,
+    #[allow(dead_code)]
+    pub(crate) col_no: u32,
+    pub(crate) name: String,
+    pub(crate) addr: *mut c_void,
 }
 
 pub(crate) struct HeapProfiler {
@@ -67,10 +69,11 @@ impl HeapProfiler {
 
     /// Try to acquire the lock. If it is not available, wait until another thread releases it.
     /// Acquire a  global re-entrant lock over
-    /// That is, this lock can be acquired as many times as you want on a single thread without deadlocking, allowing one thread
+    /// this lock can be acquired as many times as you want on a single thread without deadlocking, allowing one thread
     #[inline(always)]
     pub(crate) fn lock(&self) -> LockGuard<'_> {
         static MUTEX: Mutex<()> = Mutex::new(());
+        // if the local thread already aquired the lock, just return.
         if LOCKED.get() {
             return LockGuard(None);
         }
@@ -78,11 +81,23 @@ impl HeapProfiler {
         LockGuard(Some(MUTEX.lock().unwrap()))
     }
 
-    fn frames(&self) -> Vec<*mut c_void> {
+    #[inline(always)]
+    fn trace_frames(&self) -> Vec<*mut c_void> {
         let _guard = self.lock();
         let mut stack = Vec::new();
         unsafe {
+            let mut skip = 0;
+
             backtrace::trace_unsynchronized(|f| {
+                // skip the call in alloc.
+                // backtrace::backtrace::libunwind::trace::h08cd42aca7d0c759
+                //prof_mem::profiler::HeapProfiler::trace_frames::h8cb48184406ee182
+                //__rustc[4794b31dd7191200]::__rust_alloc
+                //alloc::alloc::alloc::h39a8c1f0979b4a77
+                if skip < 4 {
+                    skip += 1;
+                    return true;
+                }
                 stack.push(f.ip());
                 if stack.len() < self.max_deep.get() {
                     true
@@ -128,9 +143,10 @@ impl HeapProfiler {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn insert(&self, ptr: *const u8, lay: Layout) {
         let _guard = self.lock();
-        let frames = self.frames();
+        let frames = self.trace_frames();
         unsafe {
             (&mut *self.frames.get()).assume_init_mut().insert(
                 ptr,
@@ -142,6 +158,7 @@ impl HeapProfiler {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn remove(&self, ptr: *const u8) {
         let _guard = self.lock();
         unsafe {
