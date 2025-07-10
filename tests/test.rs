@@ -1,3 +1,5 @@
+use std::thread;
+
 use prof_mem::{ProfAlloc, dump};
 
 #[global_allocator]
@@ -10,4 +12,11 @@ fn test_print() {
             dump().unwrap();
         }
     }
+    thread::spawn(|| {
+        for i in 0..1000 {
+            if i == 100 {
+                dump().unwrap();
+            }
+        }
+    });
 }
