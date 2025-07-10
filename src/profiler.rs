@@ -3,10 +3,13 @@ use std::{
     cell::{Cell, UnsafeCell},
     collections::HashMap,
     ffi::c_void,
+    io::{self, Write},
     mem::MaybeUninit,
-    ptr,
     sync::{Mutex, Once},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::{native::AllocEntry, profile_proto::ProfileProtoWriter};
 
 thread_local! {
     static LOCKED:Cell<bool> = Cell::new(false);
@@ -26,18 +29,17 @@ impl<'a> Drop for LockGuard<'a> {
     }
 }
 
-#[derive(Clone)]
-struct FramesRecord {
-    alloc: usize,
-    frame: Vec<*mut c_void>,
+struct AllocFrames {
+    size: usize,
+    frames: Vec<*mut c_void>,
 }
 
-pub(crate) struct FramesSymbolRecord {
-    alloc: usize,
-    frame: Vec<Symbol>,
+pub(crate) struct AllocSymbolFrames {
+    pub(crate) ptr: *const u8,
+    pub(crate) size: usize,
+    pub(crate) frames: Vec<Symbol>,
 }
 
-#[derive(Debug)]
 pub(crate) struct Symbol {
     pub file_name: String,
     pub line_no: u32,
@@ -49,15 +51,15 @@ pub(crate) struct Symbol {
 pub(crate) struct HeapProfiler {
     max_deep: Cell<usize>,
     init_once: Once,
-    frames: UnsafeCell<MaybeUninit<HashMap<*const u8, FramesRecord>>>,
+    frames: UnsafeCell<MaybeUninit<HashMap<*const u8, AllocFrames>>>,
 }
 
 impl HeapProfiler {
     #[inline]
-    fn init_once(&self, max_deep: usize) {
+    fn init_once(&self, max_deep: Option<usize>) {
         self.init_once.call_once(|| {
             unsafe {
-                self.max_deep.set(max_deep);
+                self.max_deep.set(max_deep.unwrap());
                 (&mut *self.frames.get()).write(HashMap::new());
             };
         });
@@ -68,21 +70,12 @@ impl HeapProfiler {
     /// That is, this lock can be acquired as many times as you want on a single thread without deadlocking, allowing one thread
     #[inline(always)]
     pub(crate) fn lock(&self) -> LockGuard<'_> {
-        static mut MUTEX: *mut Mutex<()> = ptr::null_mut();
-        static ONCE: Once = Once::new();
-
+        static MUTEX: Mutex<()> = Mutex::new(());
         if LOCKED.get() {
             return LockGuard(None);
         }
-        ONCE.call_once(|| unsafe {
-            let mutex = Mutex::new(());
-            MUTEX = Box::into_raw(Box::new(mutex));
-        });
-        unsafe {
-            LOCKED.set(true);
-            let guard = Some((*MUTEX).lock().unwrap());
-            LockGuard(guard)
-        }
+        LOCKED.with(|locked| locked.set(true));
+        LockGuard(Some(MUTEX.lock().unwrap()))
     }
 
     fn frames(&self) -> Vec<*mut c_void> {
@@ -103,39 +96,36 @@ impl HeapProfiler {
         stack
     }
 
-    fn resolve_frame(&self, f: &FramesRecord) -> FramesSymbolRecord {
-        let frames: Vec<Symbol> = f
-            .frame
-            .iter()
-            .filter_map(|f| {
+    fn resolve_frames(&self, f: &[*mut c_void]) -> Vec<Symbol> {
+        f.iter()
+            .filter_map(|addr| {
                 let mut symbol: Option<Symbol> = None;
                 unsafe {
-                    backtrace::resolve_unsynchronized(*f, |frame| symbol = Some(frame.into()));
+                    backtrace::resolve_unsynchronized(*addr, |frame| {
+                        if symbol.is_none() {
+                            symbol = Some(frame.into());
+                        }
+                    });
                 }
                 symbol
             })
-            .collect();
-        FramesSymbolRecord {
-            alloc: f.alloc,
-            frame: frames,
-        }
+            .collect()
     }
 
-    pub fn clone_frames(&self) -> HashMap<*const u8, FramesRecord> {
-        let mut rs = HashMap::new();
-        unsafe {
-            for (k, v) in (*self.frames.get()).assume_init_mut().iter() {
-                rs.insert(*k, v.clone());
-            }
+    pub fn write_symbol_frames<T: Write>(
+        &self,
+        writer: &mut ProfileProtoWriter<T>,
+    ) -> io::Result<()> {
+        let _guard = self.lock();
+        let alloc_frames = unsafe { (*self.frames.get()).assume_init_ref() };
+        for (ptr, alloc_frame) in alloc_frames.iter() {
+            writer.write_symbol_frame(AllocSymbolFrames {
+                frames: self.resolve_frames(&alloc_frame.frames),
+                size: alloc_frame.size,
+                ptr: *ptr,
+            });
         }
-        rs
-    }
-
-    pub fn resolve_frames(&self, frames: HashMap<*const u8, FramesRecord>) {
-        let mut rs = HashMap::new();
-        for (k, v) in frames.iter() {
-            rs.insert(*k, self.resolve_frame(v));
-        }
+        Ok(())
     }
 
     pub(crate) fn insert(&self, ptr: *const u8, lay: Layout) {
@@ -144,9 +134,9 @@ impl HeapProfiler {
         unsafe {
             (&mut *self.frames.get()).assume_init_mut().insert(
                 ptr,
-                FramesRecord {
-                    alloc: lay.size(),
-                    frame: frames,
+                AllocFrames {
+                    size: lay.size(),
+                    frames: frames,
                 },
             );
         }
@@ -179,7 +169,7 @@ impl From<&backtrace::Symbol> for Symbol {
 unsafe impl Send for HeapProfiler {}
 unsafe impl Sync for HeapProfiler {}
 
-pub(crate) fn get_profiler(max_deep: usize) -> &'static HeapProfiler {
+pub(crate) fn get_profiler(max_deep: Option<usize>) -> &'static HeapProfiler {
     static PROFILER: HeapProfiler = HeapProfiler {
         max_deep: Cell::new(128),
         frames: UnsafeCell::new(MaybeUninit::uninit()),
@@ -189,8 +179,17 @@ pub(crate) fn get_profiler(max_deep: usize) -> &'static HeapProfiler {
     return &PROFILER;
 }
 
-pub fn dump() {
-    let profiler = get_profiler(128);
-    let frames = profiler.clone_frames();
-    profiler.resolve_frames(frames);
+pub fn dump() -> io::Result<()> {
+    let _alloc_entry = AllocEntry::new();
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(format!("mem.{}.pb", time.as_millis()))?;
+    let mut writer = ProfileProtoWriter::new(&mut file);
+    let profiler = get_profiler(None);
+    profiler.write_symbol_frames(&mut writer)?;
+    writer.flush()
 }

@@ -5,6 +5,9 @@ static ALLOC: ProfAlloc = ProfAlloc(128);
 
 #[test]
 fn test_print() {
-    println!("aaa");
-    dump();
+    for i in 0..1000 {
+        if i == 100 {
+            dump().unwrap();
+        }
+    }
 }
